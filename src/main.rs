@@ -71,22 +71,56 @@ struct AppState {
 
 // ── Helpers ──
 
-/// Verify an Ethereum wallet signature (EIP-191 personal_sign style).
-/// This is a simplified check — for real security, use a library like alloy or ethers-rs.
+/// Verify an Ethereum wallet signature (EIP-191 personal_sign style) via real
+/// ecrecover (k256). Previously a placeholder that accepted ANY well-formed
+/// signature — critical flaw found by the 2026-09-01 external audit: with
+/// verify_signatures=true, POST /transfer let anyone drain any address.
 fn verify_wallet_signature(address: &str, message: &str, sig_hex: &str) -> bool {
-    // For prototype: check that address starts with "0x" and sig looks plausible
-    // Full ecrecover would require the alloy crate — deferred to mainnet migration
-    if !address.starts_with("0x") || address.len() != 42 {
+    use k256::ecdsa::{RecoveryId, Signature, VerifyingKey};
+    use k256::elliptic_curve::sec1::ToSec1Point;
+    use k256::PublicKey;
+
+    let addr = address.strip_prefix("0x").or_else(|| address.strip_prefix("0X")).unwrap_or(address);
+    if addr.len() != 40 || hex::decode(addr).is_err() {
         return false;
     }
-    if sig_hex.len() < 130 {
+    let sig_hex = sig_hex.strip_prefix("0x").or_else(|| sig_hex.strip_prefix("0X")).unwrap_or(sig_hex);
+    let sig_bytes = match hex::decode(sig_hex) {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    if sig_bytes.len() != 65 {
+        return false; // r||s||v exactly
+    }
+    let v = sig_bytes[64];
+    if v != 27 && v != 28 {
         return false;
     }
-    // In production, use ecrecover to recover the public key from the signature
-    // and compare the derived address with the claimed address
-    let msg_hash = Keccak256::digest(format!("\x19Ethereum Signed Message:\n{}{}", message.len(), message));
-    let _msg_hash = msg_hash; // placeholder — real verification needs ecrecover
-    true // prototype: accept all well-formed signatures
+    let signature = match Signature::from_slice(&sig_bytes[..64]) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    // EIP-191 message hash
+    let eip191_message = format!(
+        "\x19Ethereum Signed Message:\n{}{}",
+        message.len(),
+        message
+    );
+    let hash = Keccak256::digest(eip191_message.as_bytes());
+    let recovery_id = match RecoveryId::from_byte(v - 27) {
+        Some(r) => r,
+        None => return false,
+    };
+    let recovered_key = match VerifyingKey::recover_from_prehash(&hash, &signature, recovery_id) {
+        Ok(k) => k,
+        Err(_) => return false,
+    };
+    // Derive the Ethereum address from the recovered public key
+    let public_key = PublicKey::from(&recovered_key);
+    let public_key_bytes = public_key.to_sec1_point(false).as_bytes().to_vec();
+    let addr_hash = Keccak256::digest(&public_key_bytes[1..]);
+    let recovered = format!("0x{}", hex::encode(&addr_hash[12..]));
+    recovered.to_lowercase() == address.to_lowercase()
 }
 
 /// Generate a semi-deterministic address from a string (for testing without wallets).
@@ -307,4 +341,52 @@ async fn main() {
         .await
         .expect("Failed to bind");
     axum::serve(listener, app).await.expect("Server error");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use k256::ecdsa::signature::Signer;
+    use k256::ecdsa::{Signature, SigningKey};
+    use sha3::{Digest, Keccak256};
+
+    fn addr_from_key(key: &SigningKey) -> String {
+        use k256::elliptic_curve::sec1::ToSec1Point;
+        use k256::PublicKey;
+        let pk = PublicKey::from(key.verifying_key());
+        let bytes = pk.to_sec1_point(false).as_bytes().to_vec();
+        let h = Keccak256::digest(&bytes[1..]);
+        format!("0x{}", hex::encode(&h[12..]))
+    }
+
+    fn sign_eip191(key: &SigningKey, message: &str) -> String {
+        let full = format!("\x19Ethereum Signed Message:\n{}{}", message.len(), message);
+        let hash = Keccak256::digest(full.as_bytes());
+        let (sig, rid) = key.sign_prehash_recoverable(&hash);
+        let rb = sig.to_bytes();
+        let v = rid.to_byte() + 27;
+        let mut out = Vec::with_capacity(65);
+        out.extend_from_slice(&rb);
+        out.push(v);
+        format!("0x{}", hex::encode(out))
+    }
+
+    #[test]
+    fn test_verify_wallet_signature_real_ecrecover() {
+        let key = SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let addr = addr_from_key(&key);
+        let msg = "transfer 0xabc 0xdef 100";
+        let sig = sign_eip191(&key, msg);
+
+        assert!(verify_wallet_signature(&addr, msg, &sig), "signature valide rejetée");
+        // signature d'un autre wallet
+        let other = SigningKey::from_slice(&[9u8; 32]).unwrap();
+        let other_addr = addr_from_key(&other);
+        assert!(!verify_wallet_signature(&addr, msg, &sign_eip191(&other, msg)), "usurpation acceptée");
+        // signature sur un autre message (montant modifié)
+        assert!(!verify_wallet_signature(&addr, "transfer 0xabc 0xdef 999999", &sig), "tampering accepté");
+        // garbage
+        assert!(!verify_wallet_signature(&addr, msg, "0xdeadbeef"));
+        assert!(!verify_wallet_signature(&addr, msg, &format!("0x{}", "ab".repeat(64)))); // 64 bytes seulement
+    }
 }
